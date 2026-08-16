@@ -159,12 +159,15 @@ async function deduplicate(supabase, leads) {
 // Batch insert
 // ---------------------------------------------------------------------------
 
-async function batchInsert(supabase, leads, batchSize = 50) {
+async function batchInsert(supabase, leads, createdBy, batchSize = 50) {
   let inserted = 0;
   let errors = 0;
 
   for (let i = 0; i < leads.length; i += batchSize) {
-    const batch = leads.slice(i, i + batchSize);
+    const batch = leads.slice(i, i + batchSize).map((lead) => ({
+      ...lead,
+      created_by: createdBy,
+    }));
 
     const { data, error } = await supabase
       .from("leads")
@@ -200,6 +203,27 @@ async function updateJobStatus(supabase, jobId, updates) {
 }
 
 // ---------------------------------------------------------------------------
+// Look up created_by from scrape_jobs (required for leads NOT NULL constraint)
+// ---------------------------------------------------------------------------
+
+async function getCreatedBy(supabase, jobId) {
+  if (!jobId) return null;
+
+  const { data, error } = await supabase
+    .from("scrape_jobs")
+    .select("created_by")
+    .eq("id", jobId)
+    .single();
+
+  if (error || !data) {
+    console.error("Failed to look up created_by:", error?.message || "not found");
+    return null;
+  }
+
+  return data.created_by;
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -217,11 +241,16 @@ async function main() {
   const supabase = initSupabase();
 
   // Mark job as running
+  let createdBy = null;
   if (config.scrapeJobId) {
     await updateJobStatus(supabase, config.scrapeJobId, {
       status: "running",
       started_at: new Date().toISOString(),
     });
+    createdBy = await getCreatedBy(supabase, config.scrapeJobId);
+    if (!createdBy) {
+      console.error("WARNING: No created_by found for this job. Leads will not have a creator reference.");
+    }
   }
 
   // Read scraper output
@@ -307,7 +336,7 @@ async function main() {
     console.log(`Would insert: ${deduplicated.length}`);
   } else {
     console.log("\nInserting leads...");
-    const { inserted, errors } = await batchInsert(supabase, deduplicated);
+    const { inserted, errors } = await batchInsert(supabase, deduplicated, createdBy);
     insertedCount = inserted;
     errorCount = errors;
     console.log(`Inserted: ${insertedCount}`);
@@ -347,6 +376,11 @@ async function main() {
   console.log(`Skipped: ${stats.skipped_count}`);
   console.log(`Errors: ${errorCount}`);
   console.log(`Status: ${config.dryRun ? "completed (dry run)" : finalStatus}`);
+
+  // Exit with error code if inserts failed (so GitHub Actions marks workflow as failed)
+  if (!config.dryRun && errorCount > 0) {
+    process.exit(1);
+  }
 }
 
 main().catch((err) => {
