@@ -1,0 +1,13 @@
+{
+  "name": "irtiqa-lead-scraper-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ingestion scripts for Google Maps scraper → Supabase",
+  "type": "module",
+  "scripts": {
+    "ingest": "node ingest.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.4"
+  }
+}
