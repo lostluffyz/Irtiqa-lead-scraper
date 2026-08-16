@@ -5,7 +5,8 @@
   "description": "Ingestion scripts for Google Maps scraper → Supabase",
   "type": "module",
   "scripts": {
-    "ingest": "node ingest.js"
+    "ingest": "node ingest.js",
+    "test": "node --test normalize.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.4"
