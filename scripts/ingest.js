@@ -290,10 +290,34 @@ async function main() {
   }
 
   // Read scraper output
+  // gosom/google-maps-scraper -json outputs NDJSON (one JSON object per line).
+  // We handle both JSON array and NDJSON formats for compatibility.
   let rawResults;
   try {
     const fileContent = readFileSync(config.inputFile, "utf8");
-    rawResults = JSON.parse(fileContent);
+    const trimmed = fileContent.trim();
+
+    if (!trimmed) {
+      rawResults = [];
+    } else if (trimmed.startsWith("[")) {
+      // JSON array format
+      rawResults = JSON.parse(trimmed);
+    } else {
+      // NDJSON format: one JSON object per line
+      rawResults = trimmed
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0)
+        .map((line, i) => {
+          try {
+            return JSON.parse(line);
+          } catch (e) {
+            throw new Error(
+              `Invalid JSON on line ${i + 1}: ${e.message}\n  Line: ${line.substring(0, 100)}`,
+            );
+          }
+        });
+    }
   } catch (err) {
     console.error("Failed to read/parse input file:", err.message);
     if (config.scrapeJobId) {
