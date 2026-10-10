@@ -29,11 +29,35 @@ on:
         required: false
         type: boolean
         default: true
+      depth:
+        description: 'How far the tool scrolls the results list (1-10)'
+        required: false
+        type: string
+        default: "2"
+      require_contact:
+        description: 'Drop rows with no valid phone and no email'
+        required: false
+        type: string
+        default: "false"
+      country_allowlist:
+        description: 'Comma-separated 2-letter country codes to keep (empty = no filter)'
+        required: false
+        type: string
+        default: ""
+      skip_closed:
+        description: 'Drop permanently closed businesses'
+        required: false
+        type: string
+        default: "false"
+
+# NOTE: no workflow-level `concurrency:` group. Overlapping dispatches run
+# as independent runs; cross-job dedupe races are possible (only the
+# place-id unique index backstops them), so dispatch sequentially.
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -45,14 +69,39 @@ jobs:
       - name: Create output directory
         run: mkdir -p results
 
-      - name: Build query file
+      - name: Validate inputs
+        env:
+          DEPTH_INPUT: ${{ inputs.depth }}
         run: |
-          echo "${{ inputs.query }} in ${{ inputs.location }}" > queries.txt
+          if ! echo "$DEPTH_INPUT" | grep -Eq '^[0-9]+$'; then
+            echo "ERROR: depth must be a positive integer (got '$DEPTH_INPUT')" >&2
+            exit 1
+          fi
+          DEPTH="$DEPTH_INPUT"
+          if [ "$DEPTH" -lt 1 ]; then DEPTH=1; fi
+          if [ "$DEPTH" -gt 10 ]; then DEPTH=10; fi
+          if [ "$DEPTH" != "$DEPTH_INPUT" ]; then
+            echo "depth clamped to $DEPTH (valid range is 1-10)"
+          fi
+          echo "DEPTH=$DEPTH" >> "$GITHUB_ENV"
+
+      - name: Build query file
+        env:
+          QUERY: ${{ inputs.query }}
+          LOCATION: ${{ inputs.location }}
+        run: |
+          echo "$QUERY in $LOCATION" > queries.txt
           echo "=== Query ==="
           cat queries.txt
 
       - name: Run Google Maps Scraper
+        timeout-minutes: 20
+        env:
+          DEPTH: ${{ env.DEPTH }}
+          EXTRACT_EMAILS: ${{ inputs.extract_emails }}
         run: |
+          EMAIL_FLAG=""
+          if [ "$EXTRACT_EMAILS" = "true" ]; then EMAIL_FLAG="-email"; fi
           docker run \
             -v gmaps-playwright-cache:/opt \
             -v "$PWD/queries.txt:/queries.txt:ro" \
@@ -61,11 +110,11 @@ jobs:
             -input /queries.txt \
             -results /out/results.json \
             -json \
-            -depth 2 \
+            -depth "$DEPTH" \
             -c 2 \
             -pages-per-browser 2 \
             -exit-on-inactivity 5m \
-            ${{ inputs.extract_emails && '-email' || '' }}
+            $EMAIL_FLAG
         continue-on-error: true
 
       - name: Check scraper output
@@ -90,9 +139,27 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SCRAPE_JOB_ID: ${{ inputs.scrape_job_id }}
+          REQUESTED_COUNT: ${{ inputs.requested_count }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          REQUIRE_CONTACT: ${{ inputs.require_contact }}
+          COUNTRY_ALLOWLIST: ${{ inputs.country_allowlist }}
+          SKIP_CLOSED: ${{ inputs.skip_closed }}
         run: |
           node scripts/ingest.js \
-            --scrape-job-id "${{ inputs.scrape_job_id }}" \
+            --scrape-job-id "$SCRAPE_JOB_ID" \
             --input results/results.json \
-            --requested "${{ inputs.requested_count }}" \
-            --dry-run "${{ inputs.dry_run }}"
+            --requested "$REQUESTED_COUNT" \
+            --dry-run "$DRY_RUN" \
+            --require-contact "$REQUIRE_CONTACT" \
+            --country-allowlist "$COUNTRY_ALLOWLIST" \
+            --skip-closed "$SKIP_CLOSED"
+
+      - name: Mark stale job as failed
+        if: always()
+        continue-on-error: true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SCRAPE_JOB_ID: ${{ inputs.scrape_job_id }}
+        run: node scripts/mark-failed.js --job-id "$SCRAPE_JOB_ID"

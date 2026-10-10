@@ -4,16 +4,23 @@
 // Irtiqa Lead Scraper — Ingestion Script
 // ============================================
 //
-// Reads Google Maps scraper JSON output, normalizes fields,
-// deduplicates (google_place_id primary, website fallback,
-// company_name+phone fallback), validates, and inserts into Supabase.
+// Reads Google Maps scraper JSON output, normalizes fields, applies
+// quality gates, deduplicates (intra-batch, then place id / website key /
+// E.164 phone / company_name+phone against the database), limits to the
+// requested count, and inserts into Supabase.
+//
+// Flow: parse NDJSON (tolerant) -> normalize -> gates -> dedupe -> LIMIT
+//   -> insert. "requested N" therefore means "up to N new valid leads".
 //
 // Usage:
 //   node ingest.js \
 //     --scrape-job-id <uuid> \
 //     --input results.json \
 //     --requested 100 \
-//     --dry-run true
+//     --dry-run true \
+//     [--require-contact true] \
+//     [--country-allowlist "NG,GH"] \
+//     [--skip-closed true]
 //
 // Environment variables:
 //   SUPABASE_URL            — Supabase project URL
@@ -22,6 +29,10 @@
 import { createClient } from "@supabase/supabase-js";
 import { readFileSync } from "fs";
 import { normalizeResult } from "./lib/normalize.js";
+import { parseNdjson } from "./lib/ndjson.js";
+import { applyGates } from "./lib/gates.js";
+import { markIntraBatchDupes } from "./lib/dedupe.js";
+import { websiteKey } from "./lib/website.js";
 
 // ---------------------------------------------------------------------------
 // Parse CLI arguments
@@ -42,6 +53,13 @@ function parseArgs() {
     inputFile: parsed["input"] || "results/results.json",
     requestedCount: parseInt(parsed["requested"] || "100", 10),
     dryRun: parsed["dry-run"] === "true",
+    // Quality gates (all default to today's behavior: no filtering)
+    requireContact: parsed["require-contact"] === "true",
+    countryAllowlist: (parsed["country-allowlist"] || "")
+      .split(",")
+      .map((c) => c.trim().toUpperCase())
+      .filter(Boolean),
+    skipClosed: parsed["skip-closed"] === "true",
   };
 }
 
@@ -67,24 +85,43 @@ function initSupabase() {
 // ---------------------------------------------------------------------------
 // Deduplication
 // ---------------------------------------------------------------------------
+//
+// Order (both passes): place id, website, phone (E.164), name+phone.
+// Intra-batch duplicates are removed first by the pure markIntraBatchDupes()
+// helper (unit-tested, no database). The DB pass then checks survivors.
+//
+// Website DB check uses the normalized host key: rows whose website contains
+// the host are fetched with ilike and compared with websiteKey() in JS,
+// because stored URLs vary in protocol/casing/trailing slash.
+// Phone DB check is one batched `.in("phone", …)` query over the valid
+// E.164 numbers in the batch.
 
-async function deduplicate(supabase, leads) {
+async function fetchPhonesInDb(supabase, e164List) {
+  const found = new Set();
+  const unique = [...new Set(e164List.filter(Boolean))];
+  for (let i = 0; i < unique.length; i += 100) {
+    const chunk = unique.slice(i, i + 100);
+    if (chunk.length === 0) continue;
+    const { data } = await supabase.from("leads").select("phone").in("phone", chunk);
+    for (const row of data || []) {
+      if (row.phone) found.add(row.phone);
+    }
+  }
+  return found;
+}
+
+async function deduplicateDb(supabase, leads) {
   const deduplicated = [];
-  const stats = { duplicate: 0, valid: 0 };
+  let duplicate = 0;
 
-  // In-memory dedup tracking
-  const seenPlaceIds = new Set();
-  const seenWebsites = new Set();
-  const seenNamePhone = new Set();
+  const phonesInDb = await fetchPhonesInDb(
+    supabase,
+    leads.filter((l) => l.phoneValid && l.phone).map((l) => l.phone),
+  );
 
   for (const lead of leads) {
     // Check google_place_id (primary)
     if (lead.google_place_id) {
-      if (seenPlaceIds.has(lead.google_place_id)) {
-        stats.duplicate++;
-        continue;
-      }
-
       const { data: existing } = await supabase
         .from("leads")
         .select("id")
@@ -92,47 +129,39 @@ async function deduplicate(supabase, leads) {
         .limit(1);
 
       if (existing && existing.length > 0) {
-        stats.duplicate++;
+        duplicate++;
         continue;
       }
-
-      seenPlaceIds.add(lead.google_place_id);
     }
 
-    // Check website (secondary)
+    // Check website (secondary, by normalized host key)
     if (lead.website) {
-      const normalizedWebsite = lead.website
-        .toLowerCase()
-        .replace(/^https?:\/\//, "")
-        .replace(/\/+$/, "");
+      const key = websiteKey(lead.website);
+      if (key) {
+        const { data: existing } = await supabase
+          .from("leads")
+          .select("id, website")
+          .ilike("website", `%${key}%`)
+          .limit(50);
 
-      if (seenWebsites.has(normalizedWebsite)) {
-        stats.duplicate++;
-        continue;
+        if (
+          existing &&
+          existing.some((row) => row.website && websiteKey(row.website) === key)
+        ) {
+          duplicate++;
+          continue;
+        }
       }
+    }
 
-      const { data: existing } = await supabase
-        .from("leads")
-        .select("id")
-        .eq("website", lead.website)
-        .limit(1);
-
-      if (existing && existing.length > 0) {
-        stats.duplicate++;
-        continue;
-      }
-
-      seenWebsites.add(normalizedWebsite);
+    // Check normalized phone (E.164)
+    if (lead.phoneValid && lead.phone && phonesInDb.has(lead.phone)) {
+      duplicate++;
+      continue;
     }
 
     // Check company_name + phone (tertiary)
     if (lead.company_name && lead.phone) {
-      const key = `${lead.company_name.toLowerCase()}|${lead.phone}`;
-      if (seenNamePhone.has(key)) {
-        stats.duplicate++;
-        continue;
-      }
-
       const { data: existing } = await supabase
         .from("leads")
         .select("id")
@@ -141,18 +170,24 @@ async function deduplicate(supabase, leads) {
         .limit(1);
 
       if (existing && existing.length > 0) {
-        stats.duplicate++;
+        duplicate++;
         continue;
       }
-
-      seenNamePhone.add(key);
     }
 
-    stats.valid++;
     deduplicated.push(lead);
   }
 
-  return { deduplicated, stats };
+  return { deduplicated, duplicate };
+}
+
+async function deduplicate(supabase, leads) {
+  const intra = markIntraBatchDupes(leads);
+  const db = await deduplicateDb(supabase, intra.kept);
+  return {
+    deduplicated: db.deduplicated,
+    stats: { duplicate: intra.dropped + db.duplicate, valid: db.deduplicated.length },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -163,11 +198,26 @@ async function batchInsert(supabase, leads, createdBy, batchSize = 50) {
   let inserted = 0;
   let errors = 0;
 
+  // Only real leads columns are sent. Auxiliary fields used by the gates
+  // and dedupe (phoneType, phoneValid, permanentlyClosed) never reach the DB.
+  const toRow = (lead) => ({
+    company_name: lead.company_name,
+    website: lead.website,
+    phone: lead.phone,
+    email: lead.email,
+    industry: lead.industry,
+    country: lead.country,
+    state: lead.state,
+    city: lead.city,
+    internal_notes: lead.internal_notes,
+    google_place_id: lead.google_place_id,
+    source: lead.source,
+    status: lead.status,
+    created_by: createdBy,
+  });
+
   for (let i = 0; i < leads.length; i += batchSize) {
-    const batch = leads.slice(i, i + batchSize).map((lead) => ({
-      ...lead,
-      created_by: createdBy,
-    }));
+    const batch = leads.slice(i, i + batchSize).map(toRow);
 
     const { data, error } = await supabase
       .from("leads")
@@ -235,6 +285,11 @@ async function main() {
   console.log(`Input: ${config.inputFile}`);
   console.log(`Requested: ${config.requestedCount}`);
   console.log(`Dry Run: ${config.dryRun}`);
+  console.log(
+    `Gates: requireContact=${config.requireContact} ` +
+      `countryAllowlist=[${config.countryAllowlist.join(",")}] ` +
+      `skipClosed=${config.skipClosed}`,
+  );
   console.log("");
 
   // Initialize Supabase
@@ -256,7 +311,10 @@ async function main() {
   // Read scraper output
   // gosom/google-maps-scraper -json outputs NDJSON (one JSON object per line).
   // We handle both JSON array and NDJSON formats for compatibility.
+  // Truncated or invalid NDJSON lines (e.g. a killed scraper step) are
+  // skipped and counted instead of failing the whole file.
   let rawResults;
+  let parseSkipped = 0;
   try {
     const fileContent = readFileSync(config.inputFile, "utf8");
     const trimmed = fileContent.trim();
@@ -267,20 +325,13 @@ async function main() {
       // JSON array format
       rawResults = JSON.parse(trimmed);
     } else {
-      // NDJSON format: one JSON object per line
-      rawResults = trimmed
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0)
-        .map((line, i) => {
-          try {
-            return JSON.parse(line);
-          } catch (e) {
-            throw new Error(
-              `Invalid JSON on line ${i + 1}: ${e.message}\n  Line: ${line.substring(0, 100)}`,
-            );
-          }
-        });
+      // NDJSON format: invalid lines are skipped, not fatal
+      const parsed = parseNdjson(trimmed);
+      rawResults = parsed.rows;
+      parseSkipped = parsed.skipped;
+      if (parseSkipped > 0) {
+        console.log(`Skipped ${parseSkipped} invalid/truncated line(s) in input`);
+      }
     }
   } catch (err) {
     console.error("Failed to read/parse input file:", err.message);
@@ -308,23 +359,44 @@ async function main() {
 
   console.log(`Valid after normalization: ${normalized.length}`);
 
-  // Limit to requested count
-  const limited = normalized.slice(0, config.requestedCount);
+  // Quality gates (no-ops unless enabled via CLI flags)
+  const { kept: gated, dropped: gateDropped } = applyGates(normalized, {
+    requireContact: config.requireContact,
+    countryAllowlist: config.countryAllowlist,
+    skipClosed: config.skipClosed,
+  });
+  const gateDroppedTotal =
+    gateDropped.no_contact + gateDropped.country + gateDropped.closed;
+  if (gateDroppedTotal > 0) {
+    console.log(
+      `Gates dropped ${gateDroppedTotal} ` +
+        `(no_contact=${gateDropped.no_contact} ` +
+        `country=${gateDropped.country} closed=${gateDropped.closed})`,
+    );
+  }
+
+  // Deduplicate (intra-batch first, then against the database)
+  const { deduplicated: deduped, stats: dedupStats } = await deduplicate(
+    supabase,
+    gated,
+  );
+  console.log(`After dedup: ${deduped.length} new (${dedupStats.duplicate} duplicates)`);
+
+  // Limit to requested count — applied AFTER gates and dedupe, so
+  // "requested N" means "up to N new valid leads inserted".
+  const limited = deduped.slice(0, config.requestedCount);
   console.log(`After limit: ${limited.length}`);
 
-  // Deduplicate
-  const { deduplicated, stats: dedupStats } = await deduplicate(
-    supabase,
-    limited,
-  );
-  console.log(`After dedup: ${deduplicated.length} new (${dedupStats.duplicate} duplicates)`);
-
   // Update stats
+  //   scraped_count: rows read from the tool output
+  //   valid_count:   rows that survived normalization AND gates
+  //   skipped_count: rows dropped by the gates
+  //   duplicate_count: rows dropped by dedupe
   const stats = {
     scraped_count: rawResults.length,
-    valid_count: normalized.length,
+    valid_count: gated.length,
     duplicate_count: dedupStats.duplicate,
-    skipped_count: limited.length - deduplicated.length - dedupStats.duplicate,
+    skipped_count: gateDroppedTotal,
   };
 
   // Insert (or dry run)
@@ -333,10 +405,10 @@ async function main() {
 
   if (config.dryRun) {
     console.log("\n=== DRY RUN — No database writes ===");
-    console.log(`Would insert: ${deduplicated.length}`);
+    console.log(`Would insert: ${limited.length}`);
   } else {
     console.log("\nInserting leads...");
-    const { inserted, errors } = await batchInsert(supabase, deduplicated, createdBy);
+    const { inserted, errors } = await batchInsert(supabase, limited, createdBy);
     insertedCount = inserted;
     errorCount = errors;
     console.log(`Inserted: ${insertedCount}`);

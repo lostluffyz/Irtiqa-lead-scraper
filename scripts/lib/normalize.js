@@ -16,6 +16,29 @@
 //   latitude:        number
 //   longitude:       number
 //   emails:          string[]
+//
+// NOTE: the tool's exact field for permanently-closed businesses is NOT
+// visible in this repo (fixtures/tests/README show no such field).
+// detectClosed() therefore checks raw.permanently_closed === true plus
+// status/open-hours text matching /permanently closed|closed permanently/i.
+// If the real tool field differs, only detectClosed() needs to change.
+
+import { normalizePhone } from "./phone.js";
+import { pickBestEmail } from "./email.js";
+import { cleanWebsite } from "./website.js";
+import { normalizeCountry, titleCasePlace } from "./country.js";
+
+const CLOSED_TEXT_RE = /permanently\s*closed|closed\s*permanently/i;
+
+export function detectClosed(item) {
+  if (!item || typeof item !== "object") return false;
+  if (item.permanently_closed === true) return true;
+  for (const key of ["status", "business_status", "open_hours", "opening_hours", "hours"]) {
+    const value = item[key];
+    if (typeof value === "string" && CLOSED_TEXT_RE.test(value)) return true;
+  }
+  return false;
+}
 
 export function normalizeResult(item) {
   const company_name = item.title || item.name || null;
@@ -59,30 +82,44 @@ export function normalizeResult(item) {
     }
   }
 
-  // Extract first email
-  let email = null;
-  if (item.emails && Array.isArray(item.emails) && item.emails.length > 0) {
-    email = item.emails[0];
+  // Normalize place names: ISO codes -> full names, casing fixed.
+  // ("NG" -> "Nigeria"; "LAGOS" -> "Lagos"; mixed case untouched.)
+  country = country == null ? null : titleCasePlace(normalizeCountry(country));
+  state = state == null ? null : titleCasePlace(state);
+  city = city == null ? null : titleCasePlace(city);
+
+  // Best email (trimmed, lowercased, artifacts rejected)
+  const email = pickBestEmail(item.emails);
+
+  // Phone: store E.164 when valid, otherwise the original trimmed string
+  // (a bad phone never drops the lead). Validity is exposed for the gates.
+  const rawPhone = typeof item.phone === "string" ? item.phone.trim() : item.phone || null;
+  const phoneInfo = normalizePhone(rawPhone);
+  const phone = phoneInfo.valid ? phoneInfo.e164 : rawPhone || null;
+
+  // Human-readable notes (partners type private notes in this same field):
+  // one line per available part, joined with " | ". Latitude/longitude and
+  // place_id stay out (place_id has its own column).
+  const noteParts = [];
+  if (item.review_rating) {
+    noteParts.push(
+      `Google Maps rating ${item.review_rating}` +
+        (item.review_count ? ` (${item.review_count} reviews)` : ""),
+    );
+  } else if (item.review_count) {
+    noteParts.push(`Google Maps reviews: ${item.review_count}`);
   }
-
-  // Build metadata for internal_notes
-  const metadata = {};
-  if (item.link) metadata.google_maps_url = item.link;
-  if (item.review_rating) metadata.review_rating = item.review_rating;
-  if (item.review_count) metadata.review_count = item.review_count;
-  if (item.latitude) metadata.latitude = item.latitude;
-  if (item.longitude) metadata.longitude = item.longitude;
-  if (item.place_id) metadata.place_id = item.place_id;
-  if (item.category) metadata.category = item.category;
-
-  const internal_notes =
-    Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null;
+  if (item.category) noteParts.push(`Category: ${item.category}`);
+  if (item.link) noteParts.push(`Maps: ${item.link}`);
+  const internal_notes = noteParts.length > 0 ? noteParts.join(" | ") : null;
 
   return {
     company_name,
     // Scraper outputs "web_site" (with underscore), not "website"
-    website: item.web_site || item.website || null,
-    phone: item.phone || null,
+    website: cleanWebsite(item.web_site || item.website || null),
+    phone,
+    phoneType: phoneInfo.type,
+    phoneValid: phoneInfo.valid,
     email,
     industry: item.category || null,
     country,
@@ -90,6 +127,7 @@ export function normalizeResult(item) {
     city,
     internal_notes,
     google_place_id: item.place_id || null,
+    permanentlyClosed: detectClosed(item),
     source: "google_maps",
     status: "not_contacted",
   };

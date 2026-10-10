@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeResult } from "./lib/normalize.js";
+import { normalizeResult, detectClosed } from "./lib/normalize.js";
 
 // ---------------------------------------------------------------------------
 // Real-world gosom/google-maps-scraper schema
@@ -56,9 +56,11 @@ describe("normalizeResult — real scraper schema", () => {
     assert.equal(result.email, "info@techsolutions.com");
   });
 
-  it("extracts phone", () => {
+  it("extracts phone as digits-only E.164", () => {
     const result = normalizeResult(realItem);
-    assert.equal(result.phone, "+91-11-23456789");
+    assert.equal(result.phone, "+911123456789");
+    assert.equal(result.phoneValid, true);
+    assert.equal(result.phoneType, "unknown");
   });
 
   it("extracts industry from category", () => {
@@ -71,16 +73,64 @@ describe("normalizeResult — real scraper schema", () => {
     assert.equal(result.google_place_id, "ChIJ_test1");
   });
 
-  it("builds internal_notes JSON with metadata", () => {
+  it("builds human-readable internal_notes", () => {
     const result = normalizeResult(realItem);
-    const notes = JSON.parse(result.internal_notes);
-    assert.equal(notes.google_maps_url, realItem.link);
-    assert.equal(notes.review_rating, 4.5);
-    assert.equal(notes.review_count, 42);
-    assert.equal(notes.latitude, 28.6139);
-    assert.equal(notes.longitude, 77.209);
-    assert.equal(notes.place_id, "ChIJ_test1");
-    assert.equal(notes.category, "Software Company");
+    assert.equal(
+      result.internal_notes,
+      "Google Maps rating 4.5 (42 reviews) | Category: Software Company | Maps: https://maps/place/tech-solutions/...",
+    );
+  });
+
+  it("builds partial notes when only some parts exist", () => {
+    const result = normalizeResult({ title: "Rated Only", review_rating: 4.6 });
+    assert.equal(result.internal_notes, "Google Maps rating 4.6");
+  });
+
+  it("exposes phone validity flags for the gates", () => {
+    const good = normalizeResult({ title: "A", phone: "08031234567" });
+    assert.equal(good.phone, "+2348031234567");
+    assert.equal(good.phoneValid, true);
+    assert.equal(good.phoneType, "mobile");
+    const bad = normalizeResult({ title: "B", phone: "abc" });
+    assert.equal(bad.phone, "abc");
+    assert.equal(bad.phoneValid, false);
+  });
+
+  it("maps NG to Nigeria and title-cases places", () => {
+    const result = normalizeResult({
+      title: "Lagos Shop",
+      complete_address: { city: "ikeja", state: "LAGOS", country: "NG" },
+    });
+    assert.equal(result.country, "Nigeria");
+    assert.equal(result.state, "Lagos");
+    assert.equal(result.city, "Ikeja");
+  });
+
+  it("cleans tracking params from the website", () => {
+    const result = normalizeResult({
+      title: "Tracked",
+      web_site: "https://shop.ng/?utm_source=x&ref=y",
+    });
+    assert.equal(result.website, "https://shop.ng/?ref=y");
+  });
+
+  it("flags permanently closed businesses (tolerant detection)", () => {
+    assert.equal(normalizeResult({ title: "A" }).permanentlyClosed, false);
+    assert.equal(
+      normalizeResult({ title: "B", permanently_closed: true }).permanentlyClosed,
+      true,
+    );
+    assert.equal(
+      normalizeResult({ title: "C", status: "Permanently closed" }).permanentlyClosed,
+      true,
+    );
+  });
+
+  it("detectClosed matches closed text variants", () => {
+    assert.equal(detectClosed({ status: "Closed permanently" }), true);
+    assert.equal(detectClosed({ open_hours: "PERMANENTLY CLOSED" }), true);
+    assert.equal(detectClosed({ status: "Open now" }), false);
+    assert.equal(detectClosed(null), false);
   });
 
   it("sets source and status", () => {
@@ -208,18 +258,18 @@ describe("normalizeResult — missing fields", () => {
     assert.equal(result.email, null);
   });
 
-  it("handles website fallback from 'website' key", () => {
+  it("handles website fallback from 'website' key (cleaned)", () => {
     const result = normalizeResult({ title: "Legacy", website: "old.com" });
-    assert.equal(result.website, "old.com");
+    assert.equal(result.website, "https://old.com");
   });
 
-  it("prefers web_site over website", () => {
+  it("prefers web_site over website (cleaned)", () => {
     const result = normalizeResult({
       title: "Both",
       web_site: "new.com",
       website: "old.com",
     });
-    assert.equal(result.website, "new.com");
+    assert.equal(result.website, "https://new.com");
   });
 
   it("sets null internal_notes when no metadata present", () => {
@@ -243,14 +293,14 @@ describe("normalizeResult — flat address string parsing", () => {
     assert.equal(result.country, "Germany");
   });
 
-  it("parses 2 segment address (city, country)", () => {
+  it("parses 2 segment address (city, country, code mapped)", () => {
     const result = normalizeResult({
       title: "Two Parts",
       address: "London, UK",
     });
     assert.equal(result.city, "London");
     assert.equal(result.state, null);
-    assert.equal(result.country, "UK");
+    assert.equal(result.country, "United Kingdom");
   });
 
   it("parses 1 segment address (city only)", () => {
