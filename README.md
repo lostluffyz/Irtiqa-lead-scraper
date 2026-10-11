@@ -81,3 +81,16 @@ node --test
 Dependency-free unit tests (`node:test` + `node:assert/strict` only):
 `normalize`, `phone`, `email`, `website`, `country`, `gates`, `ndjson`,
 `dedupe` helpers plus an offline 12-row normalize+gates fixture.
+
+## Operations
+
+- Image pin: the workflow runs
+  `gosom/google-maps-scraper@sha256:<digest>` via the workflow-level
+  `SCRAPER_IMAGE` variable (pinned from run #9, 2026-10-11), guarded by a
+  "Validate scraper image digest" step that fails unless the value matches
+  `^gosom/google-maps-scraper@sha256:[0-9a-f]{64}$`. To upgrade: copy the new
+  digest from a successful run log, dry-run it (manual `workflow_dispatch`
+  with the branch selected, `dry_run=true`), then change the one line.
+- Runner pin: `runs-on: ubuntu-24.04`, because the `ubuntu-latest` label
+  migrates to Ubuntu 26 beginning 2026-10-19 (annotation seen on run #9).
+- Observed run-time: about 4 minutes and 34 places for one search at depth 4.

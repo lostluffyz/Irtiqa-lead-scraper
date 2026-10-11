@@ -54,9 +54,13 @@ on:
 # as independent runs; cross-job dedupe races are possible (only the
 # place-id unique index backstops them), so dispatch sequentially.
 
+# Pinned by digest from run #9 (2026-10-11). To upgrade: take the new digest from a successful run log, dry-run it, then change this line.
+env:
+  SCRAPER_IMAGE: gosom/google-maps-scraper@sha256:e205c02913c5a69c16fc2094b8e5b194a2f655166d2c1126d50548d216e6b1b2
+
 jobs:
   scrape:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -94,11 +98,21 @@ jobs:
           echo "=== Query ==="
           cat queries.txt
 
+      - name: Validate scraper image digest
+        env:
+          SCRAPER_IMAGE: ${{ env.SCRAPER_IMAGE }}
+        run: |
+          if ! echo "$SCRAPER_IMAGE" | grep -Eq '^gosom/google-maps-scraper@sha256:[0-9a-f]{64}$'; then
+            echo "ERROR: SCRAPER_IMAGE must match ^gosom/google-maps-scraper@sha256:[0-9a-f]{64}$ (got '$SCRAPER_IMAGE')" >&2
+            exit 1
+          fi
+
       - name: Run Google Maps Scraper
         timeout-minutes: 20
         env:
           DEPTH: ${{ env.DEPTH }}
           EXTRACT_EMAILS: ${{ inputs.extract_emails }}
+          SCRAPER_IMAGE: ${{ env.SCRAPER_IMAGE }}
         run: |
           EMAIL_FLAG=""
           if [ "$EXTRACT_EMAILS" = "true" ]; then EMAIL_FLAG="-email"; fi
@@ -106,7 +120,7 @@ jobs:
             -v gmaps-playwright-cache:/opt \
             -v "$PWD/queries.txt:/queries.txt:ro" \
             -v "$PWD/results:/out" \
-            gosom/google-maps-scraper \
+            "$SCRAPER_IMAGE" \
             -input /queries.txt \
             -results /out/results.json \
             -json \
